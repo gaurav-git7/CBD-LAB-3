@@ -168,7 +168,7 @@ blockchain.add_transaction('Diana', 'Eve', 45)
 blockchain.add_transaction('Eve', 'Alice', 60)
 
 
-# POST /add_transaction — Add a transaction to the mempool
+# POST /add_transaction — Add a transaction to the mempool and broadcast to peers
 @app.route('/add_transaction', methods=['POST'])
 def add_transaction():
     json_data = request.get_json()
@@ -176,10 +176,39 @@ def add_transaction():
     if not json_data or not all(field in json_data for field in required_fields):
         return jsonify({'error': 'Missing fields. Required: sender, receiver, amount'}), 400
     index = blockchain.add_transaction(json_data['sender'], json_data['receiver'], json_data['amount'])
+
+    # Broadcast the transaction to all connected peer nodes
+    for node in blockchain.nodes:
+        try:
+            requests.post(f'http://{node}/receive_transaction', json={
+                'sender': json_data['sender'],
+                'receiver': json_data['receiver'],
+                'amount': json_data['amount']
+            }, timeout=3)
+        except requests.exceptions.RequestException:
+            continue  # Skip unreachable nodes
+
     response = {
-        'message': f'This transaction will be added to Block {index}',
+        'message': f'This transaction will be added to Block {index} and broadcast to all peers',
         'pending_transactions': len(blockchain.transactions)
     }
+    return jsonify(response), 201
+
+
+# POST /receive_transaction — Internal endpoint: receive a broadcasted transaction (no re-broadcast)
+# Only accepts requests from registered peer nodes
+@app.route('/receive_transaction', methods=['POST'])
+def receive_transaction():
+    # Extract IPs of all registered peer nodes
+    peer_ips = {node.split(':')[0] for node in blockchain.nodes}
+    if request.remote_addr not in peer_ips:
+        return jsonify({'error': 'Forbidden: only peer nodes can call this endpoint'}), 403
+    json_data = request.get_json()
+    required_fields = ['sender', 'receiver', 'amount']
+    if not json_data or not all(field in json_data for field in required_fields):
+        return jsonify({'error': 'Missing fields'}), 400
+    index = blockchain.add_transaction(json_data['sender'], json_data['receiver'], json_data['amount'])
+    response = {'message': f'Transaction received and added to mempool. Will be in Block {index}'}
     return jsonify(response), 201
 
 
@@ -193,15 +222,15 @@ def pending_transactions():
     return jsonify(response), 200
 
 
-# GET /mine_block — Mine a new block (requires at least 5 pending transactions)
+# GET /mine_block — Mine a new block (requires at least 1, takes up to 5 pending transactions)
 @app.route('/mine_block', methods=['GET'])
 def mine_block():
-    if len(blockchain.transactions) < 5:
+    if len(blockchain.transactions) < 1:
         return jsonify({
-            'error': f'Not enough transactions to mine (min 5). Current: {len(blockchain.transactions)}'
+            'error': 'No pending transactions to mine. Add at least 1 transaction first.'
         }), 400
 
-    # Take first 5 transactions from the mempool
+    # Take up to 5 transactions from the mempool
     transactions_to_mine = blockchain.transactions[:5]
 
     # Add mining reward transaction
@@ -225,6 +254,15 @@ def mine_block():
 
     block = blockchain.create_block(proof, previous_hash, merkle_root, transactions_to_mine, timestamp, block_hash)
 
+    # Broadcast mined transactions to all peers so they remove them from their mempools
+    for node in blockchain.nodes:
+        try:
+            requests.post(f'http://{node}/sync_mempool', json={
+                'mined_transactions': transactions_to_mine
+            }, timeout=3)
+        except requests.exceptions.RequestException:
+            continue
+
     response = {
         'message': 'Congratulations, you just mined a block!',
         'index': block['index'],
@@ -234,6 +272,27 @@ def mine_block():
         'merkle_root': block['merkle_root'],
         'block_hash': block['block_hash'],
         'transactions': block['transactions']
+    }
+    return jsonify(response), 200
+
+
+# POST /sync_mempool — Internal endpoint: remove mined transactions from this node's mempool
+# Only accepts requests from registered peer nodes
+@app.route('/sync_mempool', methods=['POST'])
+def sync_mempool():
+    peer_ips = {node.split(':')[0] for node in blockchain.nodes}
+    if request.remote_addr not in peer_ips:
+        return jsonify({'error': 'Forbidden: only peer nodes can call this endpoint'}), 403
+    json_data = request.get_json()
+    mined_transactions = json_data.get('mined_transactions', [])
+    removed = 0
+    for tx in mined_transactions:
+        if tx in blockchain.transactions:
+            blockchain.transactions.remove(tx)
+            removed += 1
+    response = {
+        'message': f'Mempool synced. {removed} transaction(s) removed.',
+        'pending_transactions': len(blockchain.transactions)
     }
     return jsonify(response), 200
 
